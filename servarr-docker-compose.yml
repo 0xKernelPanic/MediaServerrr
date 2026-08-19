@@ -11,9 +11,17 @@ services:
 # INFRASTRUCTURE
 ######################################################################################################################################################################
 
-#gluetun - VPN tunnel. Only qbittorrent goes through it - the rest of the *arr suite uses the host's real IP
-#          (only swarm participation needs the IP hidden; browsing and searching indexers is plain HTTP traffic,
-#          and keeping it behind a shared VPN provider IP causes Cloudflare blocks more often than it protects anything).
+#gluetun - VPN tunnel. Everything that touches a tracker goes through it:
+#          qbittorrent (joins the swarm), prowlarr (searches indexers and fetches
+#          the .torrent/magnet on behalf of sonarr/radarr/lidarr) and flaresolverr.
+#          The rest of the stack stays on the bridge with the host's real IP -
+#          sonarr/radarr/lidarr never talk to a tracker directly, they go through
+#          prowlarr, so routing them too would add breakage without hiding anything.
+#
+#          Trade-off, be aware of it: indexer sites now see a shared VPN IP, which
+#          means more Cloudflare challenges and, on private trackers, a login from
+#          an address flagged as a VPN. If one indexer starts failing constantly
+#          this is the first thing to check.
 ###################################################################################
   gluetun:
     image: qmcgaw/gluetun
@@ -25,13 +33,19 @@ services:
     networks:
       servarrnetwork:
         ipv4_address: 172.39.0.2
+    # Every service sharing this namespace publishes its ports HERE, not on itself.
     ports:
       - 8080:8080 # qbittorrent web interface
+      - 9696:9696 # prowlarr web interface
+      - 8191:8191 # flaresolverr (only prowlarr uses it - drop this line if you never debug it directly)
       #- 6881:6881 # qbittorrent torrent port
       #- 6789:6789 # nzbget
     volumes:
       - ./gluetun:/gluetun
     # Make a '.env' file in the same directory.
+    # If a web UI is unreachable from another machine on your LAN, add your LAN
+    # subnet there so gluetun's firewall lets the replies back out, e.g.:
+    #   FIREWALL_OUTBOUND_SUBNETS=192.168.1.0/24
     env_file:
       - .env
     healthcheck:
@@ -60,7 +74,7 @@ services:
 # DOWNLOADING
 #########################################################################################################################################
 
-#qbittorrent - the only service actually routed through the VPN (it joins a swarm)
+#qbittorrent - routed through the VPN (it joins a swarm)
 ###################################################################################
   qbittorrent:
     image: lscr.io/linuxserver/qbittorrent:latest
@@ -113,11 +127,15 @@ services:
 # INDEXERS
 ######################################################################################################################################################################
 
-#prowlarr - manages indexers
+#prowlarr - manages indexers, routed through the VPN
 ###################################################################################
+# Reachable from the rest of the stack at 172.39.0.2:9696 (gluetun's address), NOT
+# at its old 172.39.0.11 - see the migration notes at the end of the file.
   prowlarr:
     image: lscr.io/linuxserver/prowlarr:latest
     container_name: prowlarr
+    labels:
+      - deunhealth.restart.on.unhealthy=true
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
@@ -127,27 +145,45 @@ services:
       - ./prowlarr/config:/config
       - ./prowlarr/cache:/cache
     restart: unless-stopped
-    ports:
-      - 9696:9696
-    networks:
-      servarrnetwork:
-        ipv4_address: 172.39.0.11
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    network_mode: service:gluetun
+    healthcheck:
+      test: ping -c 1 www.google.com || exit 1
+      interval: 60s
+      retries: 3
+      start_period: 30s
+      timeout: 10s
 
 #flaresolverr - helps with captchas for indexers
 ###################################################################################
-# Must sit on the same network path as prowlarr (the host's real IP) - Cloudflare
-# binds a solved challenge to the IP, so if the two disagree the validation fails.
+# Shares gluetun's namespace with prowlarr, so Cloudflare sees one and the same IP
+# solving the challenge and then using it - which is exactly what it wants.
+# Prowlarr must now be pointed at http://localhost:8191, not at 172.39.0.12:8191.
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
     container_name: flaresolverr
     environment:
       - TZ=${TZ}
     restart: unless-stopped
-    ports:
-      - 8191:8191
-    networks:
-      servarrnetwork:
-        ipv4_address: 172.39.0.12
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    network_mode: service:gluetun
+    # The image is python-slim and ships no ping/curl/wget, hence the python probe.
+    # Uncomment to let deunhealth restart it too (and add the label above);
+    # verify it passes first - a future base image may move python off PATH.
+    #labels:
+    #  - deunhealth.restart.on.unhealthy=true
+    #healthcheck:
+    #  test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8191/', timeout=10)\" || exit 1"]
+    #  interval: 60s
+    #  retries: 3
+    #  start_period: 30s
+    #  timeout: 15s
 
 #########################################################################################################################################
 # MEDIA MANAGEMENT
@@ -448,20 +484,26 @@ services:
 #    shm_size: 1gb         # Chromium crashes on the default 64 MB /dev/shm
 
 #########################################################################################################################################
-# Newer additions to this stack. Remove the '#' to add the service.
+# ONE-TIME MIGRATION after moving prowlarr + flaresolverr behind the VPN
 #
-#  ytdl-sub:
-#    image: ghcr.io/jmbannon/ytdl-sub:latest
-#    container_name: ytdl-sub
-#    environment:
-#      - PUID=${PUID}
-#      - PGID=${PGID}
-#      - TZ=${TZ}
-#      - DOCKER_MODS=linuxserver/mods:universal-cron
-#    volumes:
-#      - ./ytdl-sub:/config
-#      - /data/youtube:/youtube
-#    networks:
-#      servarrnetwork:
-#        ipv4_address: 172.39.0.10
-#    restart: unless-stopped
+# Both containers gave up their own IPs (172.39.0.11 / .12) and now answer on
+# gluetun's address, so three places hold a now-dead address:
+#
+#  1. Prowlarr -> Settings -> Indexers -> FlareSolverr proxy:
+#       http://172.39.0.12:8191  ->  http://localhost:8191
+#     (same namespace now, so it is literally localhost)
+#
+#  2. Prowlarr -> Settings -> Apps -> each of sonarr/radarr/lidarr,
+#     field "Prowlarr Server":
+#       http://172.39.0.11:9696  ->  http://172.39.0.2:9696
+#     The "<App> Server" field on the same form (172.39.0.6/.7/.8) stays as it is.
+#     Hit "Test", then Sync App Indexers so the *arrs get the new Torznab URLs.
+#
+#  3. Anything else pointing at prowlarr - Jellyseerr, dashboards, bookmarks:
+#       172.39.0.11:9696  ->  172.39.0.2:9696  (or host-ip:9696, unchanged)
+#
+# Apply with:  docker compose up -d
+# Verify the tunnel actually covers them - both must print the VPN's IP, not yours:
+#   docker exec prowlarr     curl -s https://ipinfo.io/ip
+#   docker exec flaresolverr python -c "import urllib.request;print(urllib.request.urlopen('https://ipinfo.io/ip').read().decode())"
+#########################################################################################################################################
