@@ -474,36 +474,3 @@ services:
         condition: service_started
       jellyseerr:
         condition: service_started
-
-# Remote Play variant (phone, set-top box, weak smart TV browser): WebRTC has to
-# advertise an address the client can actually reach, and from the bridge it can
-# only offer 172.39.0.16. Replace the 'ports' and 'networks' blocks above with:
-#    network_mode: host    # takes :1420, :3478/udp and 49200-49260/udp (TURN)
-#    devices:
-#      - /dev/dri:/dev/dri # GL + encode for the headless Chromium
-#    shm_size: 1gb         # Chromium crashes on the default 64 MB /dev/shm
-
-#########################################################################################################################################
-# ONE-TIME MIGRATION after moving prowlarr + flaresolverr behind the VPN
-#
-# Both containers gave up their own IPs (172.39.0.11 / .12) and now answer on
-# gluetun's address, so three places hold a now-dead address:
-#
-#  1. Prowlarr -> Settings -> Indexers -> FlareSolverr proxy:
-#       http://172.39.0.12:8191  ->  http://localhost:8191
-#     (same namespace now, so it is literally localhost)
-#
-#  2. Prowlarr -> Settings -> Apps -> each of sonarr/radarr/lidarr,
-#     field "Prowlarr Server":
-#       http://172.39.0.11:9696  ->  http://172.39.0.2:9696
-#     The "<App> Server" field on the same form (172.39.0.6/.7/.8) stays as it is.
-#     Hit "Test", then Sync App Indexers so the *arrs get the new Torznab URLs.
-#
-#  3. Anything else pointing at prowlarr - Jellyseerr, dashboards, bookmarks:
-#       172.39.0.11:9696  ->  172.39.0.2:9696  (or host-ip:9696, unchanged)
-#
-# Apply with:  docker compose up -d
-# Verify the tunnel actually covers them - both must print the VPN's IP, not yours:
-#   docker exec prowlarr     curl -s https://ipinfo.io/ip
-#   docker exec flaresolverr python -c "import urllib.request;print(urllib.request.urlopen('https://ipinfo.io/ip').read().decode())"
-#########################################################################################################################################
